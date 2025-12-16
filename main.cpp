@@ -22,6 +22,9 @@
 using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::high_resolution_clock;
 
+// Forward declarations
+void ToggleFullscreen();
+
 // Configuration
 constexpr bool VSYNC_ENABLED = false;  // Disable for lowest latency
 constexpr size_t MAX_LOG_ENTRIES = 30; // Max log entries to display
@@ -72,6 +75,7 @@ struct AppState
     bool enableUpEvents = true;     // F7 toggles (when OFF, only DOWN events register)
     bool enableMouseHz = false;     // F8 toggles mouse polling rate display
     bool enableOverlay = true;      // F9 toggles text overlay (disable for minimal latency)
+    bool isFullscreen = true;       // F10 toggles FSE/Windowed
 
     // Mouse Hz tracking
     std::vector<Clock::time_point> mouseDeltaTimes;
@@ -316,6 +320,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
 
+    case WM_SYSKEYDOWN:
+        // F10 is a system key, so it comes through WM_SYSKEYDOWN
+        if (wParam == VK_F10)
+        {
+            ToggleFullscreen();
+            return 0; // Prevent default F10 behavior (menu activation)
+        }
+        break;
+
     case WM_DESTROY:
         g_app.running = false;
         PostQuitMessage(0);
@@ -524,6 +537,85 @@ bool InitD2D()
     return true;
 }
 
+void ToggleFullscreen()
+{
+    // Release D2D render target first (holds reference to swap chain buffer)
+    g_app.textBrush.Reset();
+    g_app.d2dRT.Reset();
+
+    // Release render target view
+    g_app.rtv.Reset();
+    g_app.context->ClearState();
+    g_app.context->Flush();
+
+    // Toggle fullscreen state
+    g_app.isFullscreen = !g_app.isFullscreen;
+
+    HRESULT hr = g_app.swapChain->SetFullscreenState(g_app.isFullscreen ? TRUE : FALSE, nullptr);
+    if (FAILED(hr))
+    {
+        // Revert state on failure
+        g_app.isFullscreen = !g_app.isFullscreen;
+    }
+
+    // Get new window size after mode switch
+    DXGI_SWAP_CHAIN_DESC1 desc;
+    g_app.swapChain->GetDesc1(&desc);
+
+    // For windowed mode, use a reasonable window size
+    if (!g_app.isFullscreen)
+    {
+        // Set windowed size and style
+        SetWindowLongPtrW(g_app.hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowLongPtrW(g_app.hwnd, GWL_EXSTYLE, 0);
+
+        // Center window at 1280x720
+        int winWidth = 1280;
+        int winHeight = 720;
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        int x = (screenW - winWidth) / 2;
+        int y = (screenH - winHeight) / 2;
+
+        SetWindowPos(g_app.hwnd, HWND_NOTOPMOST, x, y, winWidth, winHeight, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+
+        RECT clientRect;
+        GetClientRect(g_app.hwnd, &clientRect);
+        g_app.width = clientRect.right - clientRect.left;
+        g_app.height = clientRect.bottom - clientRect.top;
+    }
+    else
+    {
+        // Restore fullscreen popup style
+        SetWindowLongPtrW(g_app.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowLongPtrW(g_app.hwnd, GWL_EXSTYLE, WS_EX_TOPMOST);
+
+        g_app.width = GetSystemMetrics(SM_CXSCREEN);
+        g_app.height = GetSystemMetrics(SM_CYSCREEN);
+
+        SetWindowPos(g_app.hwnd, HWND_TOPMOST, 0, 0, g_app.width, g_app.height, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+
+    // Resize swap chain buffers
+    hr = g_app.swapChain->ResizeBuffers(0, g_app.width, g_app.height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+
+    // Recreate render target view
+    ComPtr<ID3D11Texture2D> backBuffer;
+    g_app.swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    g_app.device->CreateRenderTargetView(backBuffer.Get(), nullptr, &g_app.rtv);
+
+    // Recreate D2D render target
+    ComPtr<IDXGISurface> surface;
+    g_app.swapChain->GetBuffer(0, IID_PPV_ARGS(&surface));
+
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    g_app.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.Get(), &props, &g_app.d2dRT);
+    g_app.d2dRT->CreateSolidColorBrush(D2D1::ColorF(0.0f, 1.0f, 0.0f, 1.0f), &g_app.textBrush);
+}
+
 void Render()
 {
     // MINIMAL PATH: When overlay is disabled, skip ALL unnecessary computation for lowest latency
@@ -674,7 +766,8 @@ void Render()
                                     L"] F7=Up[" + std::wstring(g_app.enableUpEvents ? L"+" : L"-") +
                                     L"] F8=Hz[" + std::wstring(g_app.enableMouseHz ? L"+" : L"-") +
                                     L"] F9=OL[" + std::wstring(g_app.enableOverlay ? L"+" : L"-") +
-                                    L"] F5/6=" + std::to_wstring((int)g_app.flashDurationMs) + L"ms [FSE]";
+                                    L"] F10=[" + std::wstring(g_app.isFullscreen ? L"FSE" : L"WIN") +
+                                    L"] F5/6=" + std::to_wstring((int)g_app.flashDurationMs) + L"ms";
         textRect.top = (float)g_app.height - 50.0f;
         textRect.bottom = (float)g_app.height - 10.0f;
         g_app.d2dRT->DrawText(
