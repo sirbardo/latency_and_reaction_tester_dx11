@@ -1,5 +1,6 @@
 // DX11 Visual Reaction Time Tester
 // Measures visual reaction time with minimal input-to-photon latency
+// Uses WASAPI exclusive mode for low-latency audio
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -14,11 +15,15 @@
 #include <chrono>
 #include <random>
 #include <hidusage.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <cmath>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "ole32.lib")
 
 using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::high_resolution_clock;
@@ -31,6 +36,13 @@ void StartNewRound();
 constexpr float MIN_DELAY_MS = 1500.0f;  // Minimum wait before flash
 constexpr float MAX_DELAY_MS = 5000.0f;  // Maximum wait before flash
 constexpr size_t MAX_LOG_ENTRIES = 25;   // Max reaction times to display
+
+// Audio configuration
+constexpr float TONE_FREQ_HZ = 800.0f;   // Beep frequency
+constexpr float TONE_DURATION_MS = 80.0f; // Beep duration
+constexpr UINT32 AUDIO_SAMPLE_RATE = 48000;
+constexpr UINT32 AUDIO_CHANNELS = 2;
+constexpr UINT32 AUDIO_BITS = 16;
 
 // Test state
 enum class TestState
@@ -79,6 +91,20 @@ struct AppState
     int height = 1080;
     bool running = true;
     bool isFullscreen = true;
+
+    // Mode
+    bool audioMode = false;        // F1 toggles: false=visual, true=audio
+    bool beepPlayed = false;       // Track if beep was played this round
+
+    // WASAPI audio (low-latency)
+    IMMDeviceEnumerator* audioEnumerator = nullptr;
+    IMMDevice* audioDevice = nullptr;
+    IAudioClient* audioClient = nullptr;
+    IAudioRenderClient* audioRenderClient = nullptr;
+    WAVEFORMATEX* audioFormat = nullptr;
+    UINT32 audioBufferFrames = 0;
+    bool audioInitialized = false;
+    float audioLatencyMs = 0.0f;   // Reported latency for display
 } g_app;
 
 float GetRandomDelay()
@@ -92,6 +118,7 @@ void StartNewRound()
     g_app.state = TestState::Waiting;
     g_app.roundStartTime = Clock::now();
     g_app.targetDelayMs = GetRandomDelay();
+    g_app.beepPlayed = false;
 }
 
 void UpdateStats()
@@ -107,6 +134,174 @@ void UpdateStats()
     }
     g_app.averageTime = sum / g_app.reactionTimes.size();
     g_app.bestTime = best;
+}
+
+// Initialize WASAPI in exclusive mode for lowest latency
+bool InitWASAPI()
+{
+    HRESULT hr;
+
+    // Create device enumerator
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          __uuidof(IMMDeviceEnumerator), (void**)&g_app.audioEnumerator);
+    if (FAILED(hr)) return false;
+
+    // Get default audio output device
+    hr = g_app.audioEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &g_app.audioDevice);
+    if (FAILED(hr)) return false;
+
+    // Activate audio client
+    hr = g_app.audioDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&g_app.audioClient);
+    if (FAILED(hr)) return false;
+
+    // Get device's mix format as starting point
+    hr = g_app.audioClient->GetMixFormat(&g_app.audioFormat);
+    if (FAILED(hr)) return false;
+
+    // Try exclusive mode with smallest buffer
+    // Request 3ms buffer (30000 * 100ns = 3ms)
+    REFERENCE_TIME requestedDuration = 30000; // 3ms in 100ns units
+
+    // First try exclusive mode
+    hr = g_app.audioClient->Initialize(
+        AUDCLNT_SHAREMODE_EXCLUSIVE,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        requestedDuration,
+        requestedDuration,
+        g_app.audioFormat,
+        nullptr);
+
+    // If exclusive fails, fall back to shared mode with low latency
+    if (FAILED(hr))
+    {
+        // Release and reactivate for shared mode
+        g_app.audioClient->Release();
+        g_app.audioDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&g_app.audioClient);
+
+        // Shared mode with auto-convert for compatibility
+        DWORD streamFlags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        requestedDuration = 100000; // 10ms fallback
+
+        hr = g_app.audioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            streamFlags,
+            requestedDuration,
+            0,
+            g_app.audioFormat,
+            nullptr);
+
+        if (FAILED(hr)) return false;
+    }
+
+    // Get buffer size
+    hr = g_app.audioClient->GetBufferSize(&g_app.audioBufferFrames);
+    if (FAILED(hr)) return false;
+
+    // Calculate latency
+    REFERENCE_TIME latency;
+    g_app.audioClient->GetStreamLatency(&latency);
+    g_app.audioLatencyMs = (float)latency / 10000.0f;
+
+    // Get render client
+    hr = g_app.audioClient->GetService(__uuidof(IAudioRenderClient), (void**)&g_app.audioRenderClient);
+    if (FAILED(hr)) return false;
+
+    g_app.audioInitialized = true;
+    return true;
+}
+
+// Play a low-latency beep using WASAPI
+void PlayBeepWASAPI()
+{
+    if (!g_app.audioInitialized) return;
+
+    // Stop any previous playback
+    g_app.audioClient->Stop();
+    g_app.audioClient->Reset();
+
+    // Calculate samples needed for tone
+    UINT32 sampleRate = g_app.audioFormat->nSamplesPerSec;
+    UINT32 channels = g_app.audioFormat->nChannels;
+    UINT32 toneSamples = (UINT32)(sampleRate * TONE_DURATION_MS / 1000.0f);
+
+    // Clamp to buffer size
+    if (toneSamples > g_app.audioBufferFrames)
+        toneSamples = g_app.audioBufferFrames;
+
+    // Get buffer
+    BYTE* buffer;
+    HRESULT hr = g_app.audioRenderClient->GetBuffer(toneSamples, &buffer);
+    if (FAILED(hr)) return;
+
+    // Generate sine wave
+    float phaseIncrement = 2.0f * 3.14159265f * TONE_FREQ_HZ / sampleRate;
+    float phase = 0.0f;
+
+    if (g_app.audioFormat->wBitsPerSample == 32)
+    {
+        // 32-bit float format (common for WASAPI)
+        float* fBuffer = (float*)buffer;
+        for (UINT32 i = 0; i < toneSamples; i++)
+        {
+            float sample = sinf(phase) * 0.5f; // 50% volume
+            for (UINT32 ch = 0; ch < channels; ch++)
+            {
+                *fBuffer++ = sample;
+            }
+            phase += phaseIncrement;
+        }
+    }
+    else if (g_app.audioFormat->wBitsPerSample == 16)
+    {
+        // 16-bit PCM
+        INT16* iBuffer = (INT16*)buffer;
+        for (UINT32 i = 0; i < toneSamples; i++)
+        {
+            INT16 sample = (INT16)(sinf(phase) * 16000.0f);
+            for (UINT32 ch = 0; ch < channels; ch++)
+            {
+                *iBuffer++ = sample;
+            }
+            phase += phaseIncrement;
+        }
+    }
+
+    // Release buffer and start playback immediately
+    g_app.audioRenderClient->ReleaseBuffer(toneSamples, 0);
+    g_app.audioClient->Start();
+}
+
+void CleanupWASAPI()
+{
+    if (g_app.audioClient)
+    {
+        g_app.audioClient->Stop();
+    }
+    if (g_app.audioRenderClient)
+    {
+        g_app.audioRenderClient->Release();
+        g_app.audioRenderClient = nullptr;
+    }
+    if (g_app.audioFormat)
+    {
+        CoTaskMemFree(g_app.audioFormat);
+        g_app.audioFormat = nullptr;
+    }
+    if (g_app.audioClient)
+    {
+        g_app.audioClient->Release();
+        g_app.audioClient = nullptr;
+    }
+    if (g_app.audioDevice)
+    {
+        g_app.audioDevice->Release();
+        g_app.audioDevice = nullptr;
+    }
+    if (g_app.audioEnumerator)
+    {
+        g_app.audioEnumerator->Release();
+        g_app.audioEnumerator = nullptr;
+    }
 }
 
 void ProcessRawInput(LPARAM lParam)
@@ -177,6 +372,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         else if (wParam == VK_SPACE)
         {
             // Space to restart/clear
+            g_app.reactionTimes.clear();
+            g_app.averageTime = 0.0f;
+            g_app.bestTime = 0.0f;
+            g_app.lastReactionTime = 0.0f;
+            StartNewRound();
+        }
+        else if (wParam == VK_F1)
+        {
+            // F1 to toggle audio/visual mode and clear
+            g_app.audioMode = !g_app.audioMode;
             g_app.reactionTimes.clear();
             g_app.averageTime = 0.0f;
             g_app.bestTime = 0.0f;
@@ -418,13 +623,21 @@ void Render()
         {
             g_app.state = TestState::Flashing;
             g_app.flashStartTime = Clock::now();
+
+            // Play beep in audio mode (do it right after capturing time for accuracy)
+            if (g_app.audioMode && !g_app.beepPlayed)
+            {
+                g_app.beepPlayed = true;
+                PlayBeepWASAPI(); // Low-latency WASAPI beep
+            }
         }
     }
 
     // Determine background color
     float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    if (g_app.state == TestState::Flashing)
+    if (g_app.state == TestState::Flashing && !g_app.audioMode)
     {
+        // Only flash white in visual mode
         clearColor[0] = clearColor[1] = clearColor[2] = 1.0f;
     }
     else if (g_app.state == TestState::TooEarly)
@@ -442,16 +655,17 @@ void Render()
     // Draw reaction times log on left
     float logY = 80.0f;
 
-    // Header
-    D2D1_RECT_F headerRect = D2D1::RectF(20.0f, 20.0f, 300.0f, 60.0f);
-    g_app.d2dRT->DrawText(L"REACTION TIMES", 14, g_app.textFormat.Get(), headerRect, g_app.textBrush.Get());
+    // Header with mode indicator
+    std::wstring headerText = g_app.audioMode ? L"AUDIO REACTION" : L"VISUAL REACTION";
+    D2D1_RECT_F headerRect = D2D1::RectF(20.0f, 20.0f, 400.0f, 60.0f);
+    g_app.d2dRT->DrawText(headerText.c_str(), (UINT32)headerText.length(), g_app.textFormat.Get(), headerRect, g_app.textBrush.Get());
 
     // Stats
     if (!g_app.reactionTimes.empty())
     {
         wchar_t statsBuffer[128];
         swprintf_s(statsBuffer, L"Avg: %.1f ms  Best: %.1f ms", g_app.averageTime, g_app.bestTime);
-        D2D1_RECT_F statsRect = D2D1::RectF(20.0f, 45.0f, 400.0f, 80.0f);
+        D2D1_RECT_F statsRect = D2D1::RectF(20.0f, 45.0f, 600.0f, 80.0f);
         g_app.d2dRT->DrawText(statsBuffer, (UINT32)wcslen(statsBuffer), g_app.textFormat.Get(), statsRect, g_app.textBrush.Get());
     }
 
@@ -474,8 +688,9 @@ void Render()
     }
     else if (g_app.state == TestState::Flashing)
     {
-        // Use darker color on white background
-        g_app.d2dRT->DrawText(L"CLICK!", 6, g_app.textFormatLarge.Get(), centerRect, g_app.redBrush.Get());
+        // Use darker color on white background (visual mode), green on black (audio mode)
+        auto brush = g_app.audioMode ? g_app.textBrush.Get() : g_app.redBrush.Get();
+        g_app.d2dRT->DrawText(L"CLICK!", 6, g_app.textFormatLarge.Get(), centerRect, brush);
     }
     else if (g_app.state == TestState::TooEarly)
     {
@@ -483,7 +698,19 @@ void Render()
     }
 
     // Instructions at bottom
-    std::wstring instructions = L"ESC=Exit | SPACE=Clear | F10=" + std::wstring(g_app.isFullscreen ? L"FSE" : L"WIN");
+    std::wstring modeStr = g_app.audioMode ? L"AUDIO" : L"VISUAL";
+    if (g_app.audioMode && g_app.audioInitialized)
+    {
+        wchar_t latencyStr[32];
+        swprintf_s(latencyStr, L"AUDIO ~%.1fms", g_app.audioLatencyMs);
+        modeStr = latencyStr;
+    }
+    else if (g_app.audioMode && !g_app.audioInitialized)
+    {
+        modeStr = L"AUDIO (N/A)";
+    }
+    std::wstring instructions = L"ESC=Exit | SPACE=Clear | F1=[" + modeStr +
+                                L"] | F10=" + std::wstring(g_app.isFullscreen ? L"FSE" : L"WIN");
     D2D1_RECT_F instrRect = D2D1::RectF(20.0f, (float)g_app.height - 40.0f, (float)g_app.width - 20.0f, (float)g_app.height - 10.0f);
     g_app.d2dRT->DrawText(instructions.c_str(), (UINT32)instructions.length(), g_app.textFormat.Get(), instrRect, g_app.textBrush.Get());
 
@@ -494,6 +721,8 @@ void Render()
 
 void Cleanup()
 {
+    CleanupWASAPI();
+
     if (g_app.swapChain)
     {
         g_app.swapChain->SetFullscreenState(FALSE, nullptr);
@@ -502,6 +731,9 @@ void Cleanup()
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 {
+    // Initialize COM for WASAPI
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
     if (!InitWindow())
     {
         MessageBoxW(nullptr, L"Failed to create window", L"Error", MB_OK);
@@ -518,6 +750,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     {
         MessageBoxW(nullptr, L"Failed to initialize Direct2D", L"Error", MB_OK);
         return 1;
+    }
+
+    // Initialize WASAPI for low-latency audio (non-fatal if fails)
+    if (!InitWASAPI())
+    {
+        // Audio won't work but visual mode still will
+        g_app.audioInitialized = false;
     }
 
     StartNewRound();
@@ -540,5 +779,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     }
 
     Cleanup();
+    CoUninitialize();
     return 0;
 }

@@ -31,7 +31,7 @@ if %ERRORLEVEL% EQU 0 (
         /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_UNICODE" /D "UNICODE" ^
         reaction.cpp ^
         /link /SUBSYSTEM:WINDOWS ^
-        d3d11.lib dxgi.lib d2d1.lib dwrite.lib user32.lib ^
+        d3d11.lib dxgi.lib d2d1.lib dwrite.lib user32.lib ole32.lib ^
         /OUT:ReactionTester.exe
 
     if !ERRORLEVEL! EQU 0 (
