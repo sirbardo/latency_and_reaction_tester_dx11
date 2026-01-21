@@ -54,7 +54,7 @@ if %ERRORLEVEL% EQU 0 (
     echo.
     echo [1/2] Building LatencyTester.exe...
     g++.exe -o LatencyTester.exe main.cpp ^
-        -O3 -Wall -mwindows -municode ^
+        -O3 -Wall -mwindows -municode -static ^
         -DWIN32 -DNDEBUG -D_WINDOWS -DUNICODE -D_UNICODE ^
         -ld3d11 -ldxgi -ld2d1 -ldwrite -luser32 -lole32 -luuid
 
@@ -67,7 +67,7 @@ if %ERRORLEVEL% EQU 0 (
     echo.
     echo [2/2] Building ReactionTester.exe...
     g++.exe -o ReactionTester.exe reaction.cpp ^
-        -O3 -Wall -mwindows -municode ^
+        -O3 -Wall -mwindows -municode -static ^
         -DWIN32 -DNDEBUG -D_WINDOWS -DUNICODE -D_UNICODE ^
         -ld3d11 -ldxgi -ld2d1 -ldwrite -luser32 -lole32 -luuid
 
